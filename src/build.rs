@@ -14,7 +14,7 @@ use tar::Archive;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PackageManifest {
     pub package: PackageInfo,
-    pub source: SourceInfo,
+    pub sources: Vec<SourceInfo>,
     pub build: BuildInfo,
 }
 
@@ -29,6 +29,7 @@ pub struct PackageInfo {
     pub version: String,
     pub description: String,
     pub dependencies: Vec<String>, // Runtime dependencies
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -297,84 +298,87 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("Failed to create dest directory {:?}: {}", dest_dir, e))?;
 
     // Phase 3: Retrieve and Verify Upstream Sources
-    let download_path = if let Some(ref file_name) = manifest.source.file {
-        let local_path = package_dir.join(file_name);
-        if !local_path.exists() {
-            return Err(format!("Local source file not found at {:?}", local_path));
-        }
-        let dest_path = src_dir.join(file_name);
-        println!(
-            "Copying local source file from {:?} to {:?}",
-            local_path, dest_path
-        );
-        fs::copy(&local_path, &dest_path)
-            .map_err(|e| format!("Failed to copy local source: {}", e))?;
-        Some(dest_path)
-    } else if let Some(ref url_str) = manifest.source.url {
-        let filename = url_str
-            .split('/')
-            .last()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("source.archive");
+    if manifest.sources.is_empty() {
+        return Err("No source target declared in the manifest 'sources' array".to_string());
+    }
 
-        let dest_path = src_dir.join(filename);
-        println!("Downloading {} from {} ...", filename, url_str);
-
-        let response = ureq::get(url_str)
-            .call()
-            .map_err(|e| format!("Failed to download source from {}: {}", url_str, e))?;
-
-        let mut reader = response.into_reader();
-        let mut file = File::create(&dest_path)
-            .map_err(|e| format!("Failed to create file {:?}: {}", dest_path, e))?;
-
-        io::copy(&mut reader, &mut file)
-            .map_err(|e| format!("Failed to write downloaded data: {}", e))?;
-        Some(dest_path)
-    } else if let Some(ref git_url) = manifest.source.git {
-        println!("Cloning git repository from {} ...", git_url);
-        let status = Command::new("git")
-            .arg("clone")
-            .arg(git_url)
-            .arg(&src_dir)
-            .status()
-            .map_err(|e| format!("Failed to execute git clone: {}", e))?;
-        if !status.success() {
-            return Err(format!(
-                "git clone exited with non-zero status: {:?}",
-                status.code()
-            ));
-        }
-        None
-    } else {
-        return Err("Source must specify one of 'url', 'file', or 'git'".to_string());
-    };
-
-    // Verify Checksum if applicable (non-git sources require checksum)
-    if let Some(ref path) = download_path {
-        if let Some(ref checksum) = manifest.source.checksum {
-            match checksum.algorithm.as_str() {
-                "sha256" => {
-                    let computed_hash = compute_file_sha256(path)?;
-                    if computed_hash != checksum.value {
-                        let _ = fs::remove_file(path);
-                        return Err(format!(
-                            "Integrity check failed. Expected SHA256 ({}): {}, Got: {}",
-                            checksum.algorithm, checksum.value, computed_hash
-                        ));
-                    }
-                    println!("Integrity check passed (SHA256: {})", computed_hash);
-                }
-                other => {
-                    return Err(format!("Unsupported checksum algorithm: {}", other));
-                }
+    for source in &manifest.sources {
+        let download_path = if let Some(ref file_name) = source.file {
+            let local_path = package_dir.join(file_name);
+            if !local_path.exists() {
+                return Err(format!("Local source file not found at {:?}", local_path));
             }
-        } else {
-            return Err("Checksum configuration is required for file and url sources".to_string());
-        }
+            let dest_path = src_dir.join(file_name);
+            println!(
+                "Copying local source file from {:?} to {:?}",
+                local_path, dest_path
+            );
+            fs::copy(&local_path, &dest_path)
+                .map_err(|e| format!("Failed to copy local source {}: {}", file_name, e))?;
+            Some(dest_path)
+        } else if let Some(ref url_str) = source.url {
+            let filename = url_str
+                .split('/')
+                .last()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("source.archive");
 
-        println!("Unpacking source archive {:?} inside {:?}", path, src_dir);
-        unpack_archive(path, &src_dir)?;
+            let dest_path = src_dir.join(filename);
+            println!("Downloading {} from {} ...", filename, url_str);
+
+            let response = ureq::get(url_str)
+                .call()
+                .map_err(|e| format!("Failed to download source from {}: {}", url_str, e))?;
+
+            let mut reader = response.into_reader();
+            let mut file = File::create(&dest_path)
+                .map_err(|e| format!("Failed to create file {:?}: {}", dest_path, e))?;
+
+            io::copy(&mut reader, &mut file)
+                .map_err(|e| format!("Failed to write downloaded data: {}", e))?;
+            Some(dest_path)
+        } else if let Some(ref git_url) = source.git {
+            println!("Cloning git repository from {} ...", git_url);
+            let status = Command::new("git")
+                .arg("clone")
+                .arg(git_url)
+                .arg(&src_dir)
+                .status()
+                .map_err(|e| format!("Failed to execute git clone: {}", e))?;
+            if !status.success() {
+                return Err(format!(
+                    "git clone exited with non-zero status: {:?}",
+                    status.code()
+                ));
+            }
+            None
+        } else {
+            return Err("Source must specify one of 'url', 'file', or 'git'".to_string());
+        };
+
+        // Verify Checksum if applicable (non-git sources require checksum)
+        if let Some(ref path) = download_path {
+            if let Some(ref checksum) = source.checksum {
+                match checksum.algorithm.as_str() {
+                    "sha256" => {
+                        let computed_hash = compute_file_sha256(path)?;
+                        if computed_hash != checksum.value {
+                            let _ = fs::remove_file(path);
+                            return Err(format!(
+                                "Integrity check failed. Expected SHA256 ({}): {}, Got: {}",
+                                checksum.algorithm, checksum.value, computed_hash
+                            ));
+                        }
+                        println!("Integrity check passed (SHA256: {})", computed_hash);
+                    }
+                    other => {
+                        return Err(format!("Unsupported checksum algorithm: {}", other));
+                    }
+                }
+            } else {
+                return Err("Checksum configuration is required for file and url sources".to_string());
+            }
+        }
     }
 
     // Phase 4: Stage Configuration and Scripts
