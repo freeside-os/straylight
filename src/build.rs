@@ -19,6 +19,11 @@ pub struct PackageManifest {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct BinaryPackageManifest {
+    pub package: PackageInfo,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PackageInfo {
     pub name: String,
     pub version: String,
@@ -476,9 +481,14 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
     fs::create_dir_all(&meta_dir)
         .map_err(|e| format!("Failed to create staging meta dir: {}", e))?;
 
+    let binary_manifest = BinaryPackageManifest {
+        package: manifest.package.clone(),
+    };
+    let binary_manifest_toml = toml::to_string(&binary_manifest)
+        .map_err(|e| format!("Failed to serialize binary manifest: {}", e))?;
     let meta_manifest = meta_dir.join("package.manifest");
-    fs::copy(&manifest_path, &meta_manifest)
-        .map_err(|e| format!("Failed to copy manifest to staging: {}", e))?;
+    fs::write(&meta_manifest, binary_manifest_toml)
+        .map_err(|e| format!("Failed to write binary manifest: {}", e))?;
 
     let hooks_src = package_dir.join("hooks");
     if hooks_src.exists() {
