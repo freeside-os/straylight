@@ -427,6 +427,56 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
         }
     }
 
+    // Ensure the musl dynamic linker symlink exists inside the sandbox's /lib if it's a real directory
+    {
+        let lib_dir = sandbox_dir.join("lib");
+        let ld_musl_src = sandbox_dir.join("usr/lib/ld-musl-x86_64.so.1");
+        let ld_musl_dst = lib_dir.join("ld-musl-x86_64.so.1");
+        if lib_dir.is_dir() && ld_musl_src.exists() && !ld_musl_dst.exists() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("../usr/lib/ld-musl-x86_64.so.1", &ld_musl_dst)
+                .map_err(|e| format!("Failed to create ld-musl symlink inside sandbox: {}", e))?;
+        }
+
+        // Also ensure libgcc_s.so.1 is present in the sandbox's usr/lib
+        let libgcc_sandbox = sandbox_dir.join("usr/lib/libgcc_s.so.1");
+        if !libgcc_sandbox.exists() {
+            let local_libgcc = builder_root.join("libgcc_s.so.1");
+            if local_libgcc.exists() {
+                std::fs::copy(&local_libgcc, &libgcc_sandbox)
+                    .map_err(|e| format!("Failed to copy local libgcc_s.so.1 to sandbox: {}", e))?;
+            } else {
+                for path in &["/usr/lib/libgcc_s.so.1", "/lib/libgcc_s.so.1", "/lib/x86_64-linux-gnu/libgcc_s.so.1"] {
+                    let p = std::path::Path::new(path);
+                    if p.exists() {
+                        std::fs::copy(p, &libgcc_sandbox)
+                            .map_err(|e| format!("Failed to copy host libgcc_s.so.1 to sandbox: {}", e))?;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Also ensure find is present in the sandbox's usr/bin
+        let find_sandbox = sandbox_dir.join("usr/bin/find");
+        if !find_sandbox.exists() {
+            let local_find = builder_root.join("find");
+            if local_find.exists() {
+                std::fs::copy(&local_find, &find_sandbox)
+                    .map_err(|e| format!("Failed to copy local find to sandbox: {}", e))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(&find_sandbox) {
+                        let mut perms = meta.permissions();
+                        perms.set_mode(0o755);
+                        let _ = std::fs::set_permissions(&find_sandbox, perms);
+                    }
+                }
+            }
+        }
+    }
+
     let mut cmd = Command::new("systemd-nspawn");
 
     let abs_workspace_path = build_cache_dir.canonicalize().map_err(|e| {
@@ -438,24 +488,25 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
 
     cmd.arg("-D").arg(&sandbox_dir)
         .arg("--bind").arg(format!("{}:/workspace", abs_workspace_path.to_string_lossy()))
-        .arg("--as-pid2")
-        .arg("/usr/bin/just").arg("-f").arg("/workspace/package.justfile").arg("-d").arg("/workspace/src").arg("build").arg("package").arg("/workspace/dest");
+        .arg("--as-pid2");
 
-    // Export package metadata as environment variables
-    cmd.env("PKG_NAME", &manifest.package.name);
-    cmd.env("PKG_VERSION", &manifest.package.version);
-    cmd.env("PKG_DESCRIPTION", &manifest.package.description);
-    cmd.env("PKG_DESCRITPTION", &manifest.package.description);
-    cmd.env("PKG_DEPENDENCIES", manifest.package.dependencies.join(" "));
+    // Pass environment variables into the container using --setenv
+    cmd.arg(format!("--setenv=PKG_NAME={}", manifest.package.name));
+    cmd.arg(format!("--setenv=PKG_VERSION={}", manifest.package.version));
+    cmd.arg(format!("--setenv=PKG_DESCRIPTION={}", manifest.package.description));
+    cmd.arg(format!("--setenv=PKG_DEPENDENCIES={}", manifest.package.dependencies.join(" ")));
     if let Some(ref group) = manifest.package.group {
-        cmd.env("PKG_GROUP", group);
+        cmd.arg(format!("--setenv=PKG_GROUP={}", group));
     }
 
     if let Some(ref env_map) = manifest.build.env {
         for (k, v) in env_map {
-            cmd.env(k, v);
+            cmd.arg(format!("--setenv={}={}", k, v));
         }
     }
+
+    cmd.arg("--setenv=DESTDIR=/workspace/dest");
+    cmd.arg("/usr/bin/just").arg("-f").arg("/workspace/package.justfile").arg("-d").arg("/workspace/src").arg("build").arg("package");
 
     println!("Spawning systemd-nspawn build...");
     let output = cmd
