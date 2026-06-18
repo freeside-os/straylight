@@ -269,12 +269,15 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
         manifest.package.name, manifest.package.version
     );
 
-    // Phase 2: Setup the Sandbox Workspace
+    // Phase 2: Resolve Builder Root
     let monorepo_root = find_monorepo_root()?;
-    let build_cache_parent = std::env::var("STRAYLIGHT_CACHE_DIR")
-        .or_else(|_| std::env::var("STRAYLIGHT_BUILD_DIR"))
+    let builder_root_buf = std::env::var("STRAYLIGHT_BUILDER_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| monorepo_root.join("build").join("straylight"));
+        .unwrap_or_else(|_| monorepo_root.join("build"));
+    let builder_root = builder_root_buf.as_path();
+
+    // Phase 3: Setup Build Workspace
+    let build_cache_parent = builder_root.join("straylight-workspace");
     let build_cache_dir = build_cache_parent.join(format!(
         "{}-{}",
         manifest.package.name, manifest.package.version
@@ -297,7 +300,7 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
     fs::create_dir_all(&dest_dir)
         .map_err(|e| format!("Failed to create dest directory {:?}: {}", dest_dir, e))?;
 
-    // Phase 3: Retrieve and Verify Upstream Sources
+    // Phase 4: Retrieve and Verify Upstream Sources
     if manifest.sources.is_empty() {
         return Err("No source target declared in the manifest 'sources' array".to_string());
     }
@@ -381,7 +384,7 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
         }
     }
 
-    // Phase 4: Stage Configuration and Scripts
+    // Phase 5: Stage Configuration and Scripts
     let justfile_src = package_dir.join("package.justfile");
     if !justfile_src.exists() {
         return Err(format!(
@@ -393,22 +396,37 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
     fs::copy(&justfile_src, &justfile_dest)
         .map_err(|e| format!("Failed to stage package.justfile: {}", e))?;
 
-    // Phase 5: Execute Sandbox Compilation (systemd-nspawn)
+    // Phase 6: Resolve Sandbox and Execute Build
     if !is_root() {
         return Err("Unauthorized: 'straylight build' requires root/sudo privileges to run systemd-nspawn sandboxes.".to_string());
     }
 
-    let compiler_root_env = std::env::var("STRAYLIGHT_COMPILER_ROOT")
-        .or_else(|_| std::env::var("STRAYLIGHT_BUILD_ENV"));
-    let compiler_root_buf = compiler_root_env
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/var/lib/straylight/envs/@builder_active"));
-    let compiler_root = compiler_root_buf.as_path();
-    if !compiler_root.exists() {
-        return Err(format!(
-            "Sandbox base environment not found at {:?}",
-            compiler_root
-        ));
+    let sandbox_tarball = builder_root.join("sandbox-root.tgz");
+    let sandbox_dir = builder_root.join("sandbox");
+
+    if !sandbox_dir.exists() {
+        if sandbox_tarball.exists() {
+            println!("Sandbox directory not found. Extracting from {:?}...", sandbox_tarball);
+            fs::create_dir_all(&sandbox_dir)
+                .map_err(|e| format!("Failed to create sandbox directory {:?}: {}", sandbox_dir, e))?;
+            let status = Command::new("tar")
+                .arg("-xzf")
+                .arg(&sandbox_tarball)
+                .arg("-C")
+                .arg(&sandbox_dir)
+                .status()
+                .map_err(|e| format!("Failed to extract sandbox tarball: {}", e))?;
+            if !status.success() {
+                return Err(format!("Failed to extract sandbox tarball (exit code: {:?})", status.code()));
+            }
+            println!("Sandbox extracted successfully to {:?}", sandbox_dir);
+        } else {
+            return Err(format!(
+                "Builder sandbox not found. Expected sandbox at {:?} or tarball at {:?}.\n\
+                 Run 'just build-builder-sandbox' in the bootstrap/ directory first.",
+                sandbox_dir, sandbox_tarball
+            ));
+        }
     }
 
     let mut cmd = Command::new("systemd-nspawn");
@@ -420,7 +438,7 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
         )
     })?;
 
-    cmd.arg("-D").arg(compiler_root)
+    cmd.arg("-D").arg(&sandbox_dir)
         .arg("--bind").arg(format!("{}:/workspace", abs_workspace_path.to_string_lossy()))
         .arg("--as-pid2")
         .arg("/usr/bin/just").arg("-f").arg("/workspace/package.justfile").arg("-d").arg("/workspace/src").arg("build").arg("package").arg("/workspace/dest");
@@ -461,7 +479,7 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
         ));
     }
 
-    // Phase 6: Stage and Bundle Output Package
+    // Phase 7: Stage and Bundle Output Package
     let staging_dir = build_cache_dir.join("staging");
     if staging_dir.exists() {
         fs::remove_dir_all(&staging_dir)
@@ -513,7 +531,7 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
     fs::write(&ledger_path, ledger_toml)
         .map_err(|e| format!("Failed to write files ledger: {}", e))?;
 
-    let binaries_dir = monorepo_root.join("build").join("packages");
+    let binaries_dir = builder_root.join("packages");
     fs::create_dir_all(&binaries_dir)
         .map_err(|e| format!("Failed to create output directory: {}", e))?;
 
