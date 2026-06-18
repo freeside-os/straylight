@@ -49,9 +49,7 @@ pub struct SourceInfo {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BuildInfo {
     pub dependencies: Vec<String>, // Build-time compile dependencies
-    pub lto: Option<bool>,
-    pub cflags: Option<Vec<String>>,
-    pub ldflags: Option<Vec<String>>,
+    #[serde(alias = "environment")]
     pub env: Option<HashMap<String, String>>,
 }
 
@@ -277,7 +275,7 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
     let builder_root = builder_root_buf.as_path();
 
     // Phase 3: Setup Build Workspace
-    let build_cache_parent = builder_root.join("straylight-workspace");
+    let build_cache_parent = builder_root.join("workspace");
     let build_cache_dir = build_cache_parent.join(format!(
         "{}-{}",
         manifest.package.name, manifest.package.version
@@ -443,16 +441,14 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
         .arg("--as-pid2")
         .arg("/usr/bin/just").arg("-f").arg("/workspace/package.justfile").arg("-d").arg("/workspace/src").arg("build").arg("package").arg("/workspace/dest");
 
-    if let Some(ref cflags) = manifest.build.cflags {
-        if !cflags.is_empty() {
-            cmd.env("CFLAGS", cflags.join(" "));
-        }
-    }
-
-    if let Some(ref ldflags) = manifest.build.ldflags {
-        if !ldflags.is_empty() {
-            cmd.env("LDFLAGS", ldflags.join(" "));
-        }
+    // Export package metadata as environment variables
+    cmd.env("PKG_NAME", &manifest.package.name);
+    cmd.env("PKG_VERSION", &manifest.package.version);
+    cmd.env("PKG_DESCRIPTION", &manifest.package.description);
+    cmd.env("PKG_DESCRITPTION", &manifest.package.description);
+    cmd.env("PKG_DEPENDENCIES", manifest.package.dependencies.join(" "));
+    if let Some(ref group) = manifest.package.group {
+        cmd.env("PKG_GROUP", group);
     }
 
     if let Some(ref env_map) = manifest.build.env {
