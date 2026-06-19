@@ -10,7 +10,7 @@ fn main() {
 
     match args[1].as_str() {
         "build" => {
-            if args.len() >= 4 && args[2] == "--group" {
+            if args.len() == 4 && args[2] == "--group" {
                 match build::build_group(&args[3]) {
                     Ok(_) => {
                         println!("Group build completed successfully!");
@@ -20,9 +20,8 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
-            } else {
-                let package_dir = std::path::Path::new(&args[2]);
-                match build::build_package(package_dir) {
+            } else if args.len() == 4 && args[2] == "--pkg" {
+                match build::build_package(&args[3]) {
                     Ok(_) => {
                         println!("Build completed successfully!");
                     }
@@ -31,6 +30,9 @@ fn main() {
                         std::process::exit(1);
                     }
                 }
+            } else {
+                print_usage();
+                std::process::exit(1);
             }
         }
         "install-pkg" => {
@@ -51,7 +53,7 @@ fn main() {
 
 fn print_usage() {
     eprintln!("Usage:");
-    eprintln!("  straylight build <path-to-package-dir | name>");
+    eprintln!("  straylight build --pkg <package-name>");
     eprintln!("  straylight build --group <group-name>");
     eprintln!("  straylight install-pkg <path-to-pkg.tar.gz | name-version>");
 }

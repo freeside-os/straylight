@@ -1,5 +1,4 @@
 use flate2::Compression;
-use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -9,7 +8,6 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use tar::Archive;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PackageManifest {
@@ -76,20 +74,6 @@ pub fn is_root() -> bool {
     unsafe { geteuid() == 0 }
 }
 
-fn find_monorepo_root() -> Result<PathBuf, String> {
-    let mut current =
-        std::env::current_dir().map_err(|e| format!("Failed to get current directory: {}", e))?;
-    loop {
-        if current.join("justfile").exists() && current.join("docs").exists() {
-            return Ok(current);
-        }
-        if let Some(parent) = current.parent() {
-            current = parent.to_path_buf();
-        } else {
-            return Err("Could not find monorepo root (searched for 'justfile' and 'docs' directories up the tree)".to_string());
-        }
-    }
-}
 
 fn compute_file_sha256(path: &Path) -> Result<String, String> {
     let mut file = File::open(path)
@@ -100,34 +84,6 @@ fn compute_file_sha256(path: &Path) -> Result<String, String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn unpack_archive(archive_path: &Path, target_dir: &Path) -> Result<(), String> {
-    let path_str = archive_path.to_string_lossy();
-    if path_str.ends_with(".tar.gz") || path_str.ends_with(".tgz") {
-        let file =
-            File::open(archive_path).map_err(|e| format!("Failed to open archive: {}", e))?;
-        let tar = GzDecoder::new(file);
-        let mut archive = Archive::new(tar);
-        archive
-            .unpack(target_dir)
-            .map_err(|e| format!("Failed to unpack .tar.gz: {}", e))?;
-        Ok(())
-    } else {
-        let status = Command::new("tar")
-            .arg("-xf")
-            .arg(archive_path)
-            .arg("-C")
-            .arg(target_dir)
-            .status()
-            .map_err(|e| format!("Failed to execute tar command: {}", e))?;
-        if !status.success() {
-            return Err(format!(
-                "tar command exited with non-zero status: {:?}",
-                status.code()
-            ));
-        }
-        Ok(())
-    }
-}
 
 fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
     fs::create_dir_all(dst)
@@ -244,24 +200,28 @@ fn create_tar_gz(src_dir: &Path, dest_file: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn build_package(package_dir: &Path) -> Result<(), String> {
+pub fn build_package(package_name: &str) -> Result<(), String> {
+    // Check required environment variables (strictly, no fallbacks)
+    let packages_root = std::env::var("STRAYLIGHT_PACKAGES_ROOT")
+        .map(PathBuf::from)
+        .map_err(|_| "STRAYLIGHT_PACKAGES_ROOT environment variable must be set".to_string())?;
+
+    let builder_root = std::env::var("STRAYLIGHT_BUILDER_ROOT")
+        .map(PathBuf::from)
+        .map_err(|_| "STRAYLIGHT_BUILDER_ROOT environment variable must be set".to_string())?;
+
+    let builder_output_root = std::env::var("STRAYLIGHT_BUILDER_OUTPUT_ROOT")
+        .map(PathBuf::from)
+        .map_err(|_| "STRAYLIGHT_BUILDER_OUTPUT_ROOT environment variable must be set".to_string())?;
+
     // Phase 1: Parse the Package Manifest
-    let mut resolved_dir = package_dir.to_path_buf();
-    if !resolved_dir.exists() {
-        if let Ok(monorepo) = find_monorepo_root() {
-            let test_dir = monorepo.join("packages").join(package_dir);
-            if test_dir.exists() {
-                resolved_dir = test_dir;
-            }
-        }
-    }
-    if !resolved_dir.exists() {
+    let package_dir = packages_root.join(package_name);
+    if !package_dir.exists() {
         return Err(format!(
-            "Package directory {:?} does not exist",
+            "Package directory {:?} does not exist in STRAYLIGHT_PACKAGES_ROOT",
             package_dir
         ));
     }
-    let package_dir = resolved_dir.as_path();
     let manifest_path = package_dir.join("package.manifest");
     if !manifest_path.exists() {
         return Err(format!("Manifest file not found at {:?}", manifest_path));
@@ -276,13 +236,6 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
         "Building package: {} v{}",
         manifest.package.name, manifest.package.version
     );
-
-    // Phase 2: Resolve Builder Root
-    let monorepo_root = find_monorepo_root()?;
-    let builder_root_buf = std::env::var("STRAYLIGHT_BUILDER_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| monorepo_root.join("build"));
-    let builder_root = builder_root_buf.as_path();
 
     // Phase 3: Setup Build Workspace
     let build_cache_parent = builder_root.join("workspace");
@@ -588,15 +541,14 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
     fs::write(&ledger_path, ledger_toml)
         .map_err(|e| format!("Failed to write files ledger: {}", e))?;
 
-    let binaries_dir = builder_root.join("packages");
-    fs::create_dir_all(&binaries_dir)
+    fs::create_dir_all(&builder_output_root)
         .map_err(|e| format!("Failed to create output directory: {}", e))?;
 
     let archive_filename = format!(
         "{}-{}-1.tar.gz",
         manifest.package.name, manifest.package.version
     );
-    let archive_path = binaries_dir.join(&archive_filename);
+    let archive_path = builder_output_root.join(&archive_filename);
     println!("Archiving staging root to {:?}", archive_path);
     create_tar_gz(&staging_dir, &archive_path)?;
 
@@ -608,11 +560,17 @@ pub fn build_group(group_name: &str) -> Result<(), String> {
         return Err("Unauthorized: 'straylight build' requires root/sudo privileges to run systemd-nspawn sandboxes.".to_string());
     }
 
-    let monorepo_root = find_monorepo_root()?;
-    let builder_root_buf = std::env::var("STRAYLIGHT_BUILDER_ROOT")
+    let packages_dir = std::env::var("STRAYLIGHT_PACKAGES_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| monorepo_root.join("build"));
-    let builder_root = builder_root_buf.as_path();
+        .map_err(|_| "STRAYLIGHT_PACKAGES_ROOT environment variable must be set".to_string())?;
+
+    let builder_root = std::env::var("STRAYLIGHT_BUILDER_ROOT")
+        .map(PathBuf::from)
+        .map_err(|_| "STRAYLIGHT_BUILDER_ROOT environment variable must be set".to_string())?;
+
+    let builder_output_root = std::env::var("STRAYLIGHT_BUILDER_OUTPUT_ROOT")
+        .map(PathBuf::from)
+        .map_err(|_| "STRAYLIGHT_BUILDER_OUTPUT_ROOT environment variable must be set".to_string())?;
 
     let sandbox_tarball = builder_root.join("sandbox-root.tgz");
     let sandbox_dir = builder_root.join("sandbox");
@@ -674,8 +632,15 @@ pub fn build_group(group_name: &str) -> Result<(), String> {
 
     let mut cmd = Command::new("systemd-nspawn");
     cmd.arg("-D").arg(&sandbox_dir)
-       .arg("--bind").arg(format!("{}:/workspace", monorepo_root.to_string_lossy()))
+       .arg("--bind").arg(format!("{}:/workspace/packages", packages_dir.to_string_lossy()))
+       .arg("--bind").arg(format!("{}:/workspace/build", builder_root.to_string_lossy()))
+       .arg("--bind").arg(format!("{}:/workspace/packages_output", builder_output_root.to_string_lossy()))
        .arg("--as-pid2");
+
+    // Pass environment variables into the container using --setenv
+    cmd.arg("--setenv=STRAYLIGHT_PACKAGES_ROOT=/workspace/packages");
+    cmd.arg("--setenv=STRAYLIGHT_BUILDER_ROOT=/workspace/build");
+    cmd.arg("--setenv=STRAYLIGHT_BUILDER_OUTPUT_ROOT=/workspace/packages_output");
 
     // Spawn the fspack.py build --group command inside the container
     cmd.arg("/usr/bin/python3")
