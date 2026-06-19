@@ -246,12 +246,22 @@ fn create_tar_gz(src_dir: &Path, dest_file: &Path) -> Result<(), String> {
 
 pub fn build_package(package_dir: &Path) -> Result<(), String> {
     // Phase 1: Parse the Package Manifest
-    if !package_dir.exists() {
+    let mut resolved_dir = package_dir.to_path_buf();
+    if !resolved_dir.exists() {
+        if let Ok(monorepo) = find_monorepo_root() {
+            let test_dir = monorepo.join("packages").join(package_dir);
+            if test_dir.exists() {
+                resolved_dir = test_dir;
+            }
+        }
+    }
+    if !resolved_dir.exists() {
         return Err(format!(
             "Package directory {:?} does not exist",
             package_dir
         ));
     }
+    let package_dir = resolved_dir.as_path();
     let manifest_path = package_dir.join("package.manifest");
     if !manifest_path.exists() {
         return Err(format!("Manifest file not found at {:?}", manifest_path));
@@ -592,3 +602,99 @@ pub fn build_package(package_dir: &Path) -> Result<(), String> {
 
     Ok(())
 }
+
+pub fn build_group(group_name: &str) -> Result<(), String> {
+    if !is_root() {
+        return Err("Unauthorized: 'straylight build' requires root/sudo privileges to run systemd-nspawn sandboxes.".to_string());
+    }
+
+    let monorepo_root = find_monorepo_root()?;
+    let builder_root_buf = std::env::var("STRAYLIGHT_BUILDER_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| monorepo_root.join("build"));
+    let builder_root = builder_root_buf.as_path();
+
+    let sandbox_tarball = builder_root.join("sandbox-root.tgz");
+    let sandbox_dir = builder_root.join("sandbox");
+
+    if !sandbox_dir.exists() {
+        if sandbox_tarball.exists() {
+            println!("Sandbox directory not found. Extracting from {:?}...", sandbox_tarball);
+            fs::create_dir_all(&sandbox_dir)
+                .map_err(|e| format!("Failed to create sandbox directory {:?}: {}", sandbox_dir, e))?;
+            let status = Command::new("tar")
+                .arg("-xzf")
+                .arg(&sandbox_tarball)
+                .arg("-C")
+                .arg(&sandbox_dir)
+                .status()
+                .map_err(|e| format!("Failed to extract sandbox tarball: {}", e))?;
+            if !status.success() {
+                return Err(format!("Failed to extract sandbox tarball (exit code: {:?})", status.code()));
+            }
+            println!("Sandbox extracted successfully to {:?}", sandbox_dir);
+        } else {
+            return Err(format!(
+                "Builder sandbox not found. Expected sandbox at {:?} or tarball at {:?}.\n\
+                 Run 'just build-builder-sandbox' in the bootstrap/ directory first.",
+                sandbox_dir, sandbox_tarball
+            ));
+        }
+    }
+
+    // Ensure dynamic linker and libgcc_s.so.1 are present (same as build_package)
+    {
+        let lib_dir = sandbox_dir.join("lib");
+        let ld_musl_src = sandbox_dir.join("usr/lib/ld-musl-x86_64.so.1");
+        let ld_musl_dst = lib_dir.join("ld-musl-x86_64.so.1");
+        if lib_dir.is_dir() && ld_musl_src.exists() && !ld_musl_dst.exists() {
+            #[cfg(unix)]
+            std::os::unix::fs::symlink("../usr/lib/ld-musl-x86_64.so.1", &ld_musl_dst)
+                .map_err(|e| format!("Failed to create ld-musl symlink inside sandbox: {}", e))?;
+        }
+
+        let libgcc_sandbox = sandbox_dir.join("usr/lib/libgcc_s.so.1");
+        if !libgcc_sandbox.exists() {
+            let local_libgcc = builder_root.join("libgcc_s.so.1");
+            if local_libgcc.exists() {
+                std::fs::copy(&local_libgcc, &libgcc_sandbox)
+                    .map_err(|e| format!("Failed to copy local libgcc_s.so.1 to sandbox: {}", e))?;
+            } else {
+                for path in &["/usr/lib/libgcc_s.so.1", "/lib/libgcc_s.so.1", "/lib/x86_64-linux-gnu/libgcc_s.so.1"] {
+                    let p = std::path::Path::new(path);
+                    if p.exists() {
+                        std::fs::copy(p, &libgcc_sandbox)
+                            .map_err(|e| format!("Failed to copy host libgcc_s.so.1 to sandbox: {}", e))?;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let mut cmd = Command::new("systemd-nspawn");
+    cmd.arg("-D").arg(&sandbox_dir)
+       .arg("--bind").arg(format!("{}:/workspace", monorepo_root.to_string_lossy()))
+       .arg("--as-pid2");
+
+    // Spawn the fspack.py build --group command inside the container
+    cmd.arg("/usr/bin/python3")
+       .arg("/workspace/packages/fspack.py")
+       .arg("build")
+       .arg("--group")
+       .arg(group_name);
+
+    println!("Spawning systemd-nspawn group build for '{}'...", group_name);
+    let status = cmd.status()
+        .map_err(|e| format!("Failed to run systemd-nspawn command: {}", e))?;
+
+    if !status.success() {
+        return Err(format!(
+            "Sandbox group build exited with non-zero status: {:?}",
+            status.code()
+        ));
+    }
+
+    Ok(())
+}
+
