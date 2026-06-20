@@ -384,7 +384,7 @@ pub fn build_package(package_name: &str) -> Result<(), String> {
         } else {
             return Err(format!(
                 "Builder sandbox not found. Expected sandbox at {:?} or tarball at {:?}.\n\
-                 Run 'just build-builder-sandbox' in the bootstrap/ directory first.",
+                 Run 'just build-sandbox' in the bootstrap/ directory first.",
                 sandbox_dir, sandbox_tarball
             ));
         }
@@ -594,7 +594,7 @@ pub fn build_group(group_name: &str) -> Result<(), String> {
         } else {
             return Err(format!(
                 "Builder sandbox not found. Expected sandbox at {:?} or tarball at {:?}.\n\
-                 Run 'just build-builder-sandbox' in the bootstrap/ directory first.",
+                 Run 'just build-sandbox' in the bootstrap/ directory first.",
                 sandbox_dir, sandbox_tarball
             ));
         }
