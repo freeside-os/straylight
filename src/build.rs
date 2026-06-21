@@ -9,10 +9,12 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct PackageManifest {
     pub package: PackageInfo,
+    #[serde(default)]
     pub sources: Vec<SourceInfo>,
+    #[serde(default)]
     pub build: BuildInfo,
 }
 
@@ -21,11 +23,12 @@ pub struct BinaryPackageManifest {
     pub package: PackageInfo,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct PackageInfo {
     pub name: String,
     pub version: String,
     pub description: String,
+    #[serde(default)]
     pub dependencies: Vec<String>, // Runtime dependencies
     pub group: Option<String>,
 }
@@ -44,11 +47,12 @@ pub struct SourceInfo {
     pub checksum: Option<ChecksumInfo>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct BuildInfo {
+    #[serde(default)]
     pub dependencies: Vec<String>, // Build-time compile dependencies
     #[serde(alias = "environment")]
-    pub env: Option<HashMap<String, String>>,
+    pub env: Option<HashMap<String, toml::Value>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,9 +204,141 @@ fn create_tar_gz(src_dir: &Path, dest_file: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn has_compiled_tarball(pkg_name: &str, builder_output_root: &Path) -> Result<bool, String> {
+    if pkg_name == "musl" {
+        return Ok(true);
+    }
+    if !builder_output_root.exists() {
+        return Ok(false);
+    }
+    let prefix = format!("{}-", pkg_name);
+    for entry in fs::read_dir(builder_output_root).map_err(|e| format!("Failed to read output dir: {}", e))? {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(&prefix) && name_str.ends_with(".tar.gz") {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn load_package_manifest(packages_root: &Path, pkg_name: &str) -> Result<PackageManifest, String> {
+    let manifest_path = packages_root.join(pkg_name).join("package.manifest");
+    if !manifest_path.exists() {
+        return Err(format!("Manifest file not found for dependency '{}' at {:?}", pkg_name, manifest_path));
+    }
+    let content = fs::read_to_string(&manifest_path)
+        .map_err(|e| format!("Failed to read manifest for '{}': {}", pkg_name, e))?;
+    let manifest: PackageManifest = toml::from_str(&content)
+        .map_err(|e| format!("Failed to parse manifest for '{}': {}", pkg_name, e))?;
+    Ok(manifest)
+}
+
+fn collect_dependencies_rec(
+    pkg_name: &str,
+    packages_root: &Path,
+    visited: &mut std::collections::HashSet<String>,
+    order: &mut Vec<String>,
+    temp_visited: &mut std::collections::HashSet<String>,
+) -> Result<(), String> {
+    if temp_visited.contains(pkg_name) {
+        return Err(format!("Dependency cycle detected at '{}'", pkg_name));
+    }
+    if visited.contains(pkg_name) {
+        return Ok(());
+    }
+
+    temp_visited.insert(pkg_name.to_string());
+
+    let manifest = load_package_manifest(packages_root, pkg_name)?;
+    
+    // Merge runtime and build dependencies
+    let mut deps = Vec::new();
+    for dep in &manifest.package.dependencies {
+        if dep != "musl" && !deps.contains(dep) {
+            deps.push(dep.clone());
+        }
+    }
+    for dep in &manifest.build.dependencies {
+        if dep != "musl" && !deps.contains(dep) {
+            deps.push(dep.clone());
+        }
+    }
+
+    // Sort dependencies by name for determinism
+    deps.sort();
+
+    for dep in deps {
+        collect_dependencies_rec(&dep, packages_root, visited, order, temp_visited)?;
+    }
+
+    temp_visited.remove(pkg_name);
+    visited.insert(pkg_name.to_string());
+    order.push(pkg_name.to_string());
+
+    Ok(())
+}
+
+fn resolve_build_order(pkg_name: &str, packages_root: &Path) -> Result<Vec<String>, String> {
+    let mut visited = std::collections::HashSet::new();
+    let mut order = Vec::new();
+    let mut temp_visited = std::collections::HashSet::new();
+    collect_dependencies_rec(pkg_name, packages_root, &mut visited, &mut order, &mut temp_visited)?;
+    Ok(order)
+}
+
+fn extract_dependency(dep_name: &str, builder_output_root: &Path, sandbox_dir: &Path) -> Result<(), String> {
+    if dep_name == "musl" {
+        return Ok(());
+    }
+    if !builder_output_root.exists() {
+        return Ok(());
+    }
+    let mut candidates = Vec::new();
+    let prefix = format!("{}-", dep_name);
+    for entry in fs::read_dir(builder_output_root).map_err(|e| format!("Failed to read output dir: {}", e))? {
+        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with(&prefix) && name_str.ends_with(".tar.gz") {
+            candidates.push(entry.path());
+        }
+    }
+    if candidates.is_empty() {
+        println!("  Dependency '{}' tarball not found in builder output root, skipping auto-extract", dep_name);
+        return Ok(());
+    }
+    // Sort to pick the newest by mtime
+    candidates.sort_by(|a, b| {
+        let ma = fs::metadata(a).and_then(|m| m.modified()).ok();
+        let mb = fs::metadata(b).and_then(|m| m.modified()).ok();
+        mb.cmp(&ma)
+    });
+    let tarball = &candidates[0];
+    println!("  Auto-extracting dependency '{}' from {:?}", dep_name, tarball);
+    let status = Command::new("tar")
+        .arg("-xzf")
+        .arg(tarball)
+        .arg("--exclude=meta")
+        .arg("--exclude=./meta")
+        .arg("-C")
+        .arg(sandbox_dir)
+        .status()
+        .map_err(|e| format!("Failed to run tar command: {}", e))?;
+    if !status.success() {
+        return Err(format!("Failed to extract dependency '{}' tarball", dep_name));
+    }
+    Ok(())
+}
+
 pub fn build_package(package_name: &str) -> Result<(), String> {
-    // Check required environment variables (strictly, no fallbacks)
-    let packages_root = std::env::var("STRAYLIGHT_PACKAGES_ROOT")
+    // Phase 0: Check privileges and environments
+    if !is_root() {
+        return Err("Unauthorized: 'straylight build' requires root/sudo privileges to run systemd-nspawn sandboxes.".to_string());
+    }
+
+    let packages_dir = std::env::var("STRAYLIGHT_PACKAGES_ROOT")
         .map(PathBuf::from)
         .map_err(|_| "STRAYLIGHT_PACKAGES_ROOT environment variable must be set".to_string())?;
 
@@ -214,154 +350,7 @@ pub fn build_package(package_name: &str) -> Result<(), String> {
         .map(PathBuf::from)
         .map_err(|_| "STRAYLIGHT_BUILDER_OUTPUT_ROOT environment variable must be set".to_string())?;
 
-    // Phase 1: Parse the Package Manifest
-    let package_dir = packages_root.join(package_name);
-    if !package_dir.exists() {
-        return Err(format!(
-            "Package directory {:?} does not exist in STRAYLIGHT_PACKAGES_ROOT",
-            package_dir
-        ));
-    }
-    let manifest_path = package_dir.join("package.manifest");
-    if !manifest_path.exists() {
-        return Err(format!("Manifest file not found at {:?}", manifest_path));
-    }
-
-    let manifest_content = fs::read_to_string(&manifest_path)
-        .map_err(|e| format!("Failed to read manifest file {:?}: {}", manifest_path, e))?;
-    let manifest: PackageManifest = toml::from_str(&manifest_content)
-        .map_err(|e| format!("Failed to parse manifest: {}", e))?;
-
-    println!(
-        "Building package: {} v{}",
-        manifest.package.name, manifest.package.version
-    );
-
-    // Phase 3: Setup Build Workspace
-    let build_cache_parent = builder_root.join("workspace");
-    let build_cache_dir = build_cache_parent.join(format!(
-        "{}-{}",
-        manifest.package.name, manifest.package.version
-    ));
-
-    if build_cache_dir.exists() {
-        fs::remove_dir_all(&build_cache_dir).map_err(|e| {
-            format!(
-                "Failed to clean build cache directory {:?}: {}",
-                build_cache_dir, e
-            )
-        })?;
-    }
-
-    let src_dir = build_cache_dir.join("src");
-    let dest_dir = build_cache_dir.join("dest");
-
-    fs::create_dir_all(&src_dir)
-        .map_err(|e| format!("Failed to create src directory {:?}: {}", src_dir, e))?;
-    fs::create_dir_all(&dest_dir)
-        .map_err(|e| format!("Failed to create dest directory {:?}: {}", dest_dir, e))?;
-
-    // Phase 4: Retrieve and Verify Upstream Sources
-    if manifest.sources.is_empty() {
-        return Err("No source target declared in the manifest 'sources' array".to_string());
-    }
-
-    for source in &manifest.sources {
-        let download_path = if let Some(ref file_name) = source.file {
-            let local_path = package_dir.join(file_name);
-            if !local_path.exists() {
-                return Err(format!("Local source file not found at {:?}", local_path));
-            }
-            let dest_path = src_dir.join(file_name);
-            println!(
-                "Copying local source file from {:?} to {:?}",
-                local_path, dest_path
-            );
-            fs::copy(&local_path, &dest_path)
-                .map_err(|e| format!("Failed to copy local source {}: {}", file_name, e))?;
-            Some(dest_path)
-        } else if let Some(ref url_str) = source.url {
-            let filename = url_str
-                .split('/')
-                .last()
-                .filter(|s| !s.is_empty())
-                .unwrap_or("source.archive");
-
-            let dest_path = src_dir.join(filename);
-            println!("Downloading {} from {} ...", filename, url_str);
-
-            let response = ureq::get(url_str)
-                .call()
-                .map_err(|e| format!("Failed to download source from {}: {}", url_str, e))?;
-
-            let mut reader = response.into_reader();
-            let mut file = File::create(&dest_path)
-                .map_err(|e| format!("Failed to create file {:?}: {}", dest_path, e))?;
-
-            io::copy(&mut reader, &mut file)
-                .map_err(|e| format!("Failed to write downloaded data: {}", e))?;
-            Some(dest_path)
-        } else if let Some(ref git_url) = source.git {
-            println!("Cloning git repository from {} ...", git_url);
-            let status = Command::new("git")
-                .arg("clone")
-                .arg(git_url)
-                .arg(&src_dir)
-                .status()
-                .map_err(|e| format!("Failed to execute git clone: {}", e))?;
-            if !status.success() {
-                return Err(format!(
-                    "git clone exited with non-zero status: {:?}",
-                    status.code()
-                ));
-            }
-            None
-        } else {
-            return Err("Source must specify one of 'url', 'file', or 'git'".to_string());
-        };
-
-        // Verify Checksum if applicable (non-git sources require checksum)
-        if let Some(ref path) = download_path {
-            if let Some(ref checksum) = source.checksum {
-                match checksum.algorithm.as_str() {
-                    "sha256" => {
-                        let computed_hash = compute_file_sha256(path)?;
-                        if computed_hash != checksum.value {
-                            let _ = fs::remove_file(path);
-                            return Err(format!(
-                                "Integrity check failed. Expected SHA256 ({}): {}, Got: {}",
-                                checksum.algorithm, checksum.value, computed_hash
-                            ));
-                        }
-                        println!("Integrity check passed (SHA256: {})", computed_hash);
-                    }
-                    other => {
-                        return Err(format!("Unsupported checksum algorithm: {}", other));
-                    }
-                }
-            } else {
-                return Err("Checksum configuration is required for file and url sources".to_string());
-            }
-        }
-    }
-
-    // Phase 5: Stage Configuration and Scripts
-    let justfile_src = package_dir.join("package.justfile");
-    if !justfile_src.exists() {
-        return Err(format!(
-            "Required package.justfile not found at {:?}",
-            justfile_src
-        ));
-    }
-    let justfile_dest = build_cache_dir.join("package.justfile");
-    fs::copy(&justfile_src, &justfile_dest)
-        .map_err(|e| format!("Failed to stage package.justfile: {}", e))?;
-
-    // Phase 6: Resolve Sandbox and Execute Build
-    if !is_root() {
-        return Err("Unauthorized: 'straylight build' requires root/sudo privileges to run systemd-nspawn sandboxes.".to_string());
-    }
-
+    // Phase 0.5: Resolve and Initialize Sandbox
     let sandbox_tarball = builder_root.join("sandbox-root.tgz");
     let sandbox_dir = builder_root.join("sandbox");
 
@@ -390,7 +379,7 @@ pub fn build_package(package_name: &str) -> Result<(), String> {
         }
     }
 
-    // Ensure the musl dynamic linker symlink exists inside the sandbox's /lib if it's a real directory
+    // Ensure dynamic linker and libgcc_s.so.1 are present
     {
         let lib_dir = sandbox_dir.join("lib");
         let ld_musl_src = sandbox_dir.join("usr/lib/ld-musl-x86_64.so.1");
@@ -401,7 +390,6 @@ pub fn build_package(package_name: &str) -> Result<(), String> {
                 .map_err(|e| format!("Failed to create ld-musl symlink inside sandbox: {}", e))?;
         }
 
-        // Also ensure libgcc_s.so.1 is present in the sandbox's usr/lib
         let libgcc_sandbox = sandbox_dir.join("usr/lib/libgcc_s.so.1");
         if !libgcc_sandbox.exists() {
             let local_libgcc = builder_root.join("libgcc_s.so.1");
@@ -440,117 +428,68 @@ pub fn build_package(package_name: &str) -> Result<(), String> {
         }
     }
 
-    let mut cmd = Command::new("systemd-nspawn");
-
-    let abs_workspace_path = build_cache_dir.canonicalize().map_err(|e| {
-        format!(
-            "Failed to canonicalize workspace path {:?}: {}",
-            build_cache_dir, e
-        )
-    })?;
-
-    cmd.arg("-D").arg(&sandbox_dir)
-        .arg("--bind").arg(format!("{}:/workspace", abs_workspace_path.to_string_lossy()))
-        .arg("--as-pid2");
-
-    // Pass environment variables into the container using --setenv
-    cmd.arg(format!("--setenv=PKG_NAME={}", manifest.package.name));
-    cmd.arg(format!("--setenv=PKG_VERSION={}", manifest.package.version));
-    cmd.arg(format!("--setenv=PKG_DESCRIPTION={}", manifest.package.description));
-    cmd.arg(format!("--setenv=PKG_DEPENDENCIES={}", manifest.package.dependencies.join(" ")));
-    if let Some(ref group) = manifest.package.group {
-        cmd.arg(format!("--setenv=PKG_GROUP={}", group));
+    // Enforce UsrMerge symlinks in the sandbox
+    let usr_sbin = sandbox_dir.join("usr/sbin");
+    if usr_sbin.exists() && !usr_sbin.is_symlink() {
+        println!("  Enforcing UsrMerge: Merging sandbox usr/sbin into usr/bin...");
+        let usr_bin = sandbox_dir.join("usr/bin");
+        for entry in fs::read_dir(&usr_sbin).map_err(|e| format!("Failed to read usr/sbin: {}", e))? {
+            let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
+            let dest = usr_bin.join(entry.file_name());
+            let _ = fs::remove_file(&dest); // overwrite if exists
+            fs::copy(entry.path(), &dest)
+                .map_err(|e| format!("Failed to copy file {:?} to {:?}: {}", entry.path(), dest, e))?;
+        }
+        fs::remove_dir_all(&usr_sbin).map_err(|e| format!("Failed to remove usr/sbin: {}", e))?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("bin", &usr_sbin)
+            .map_err(|e| format!("Failed to create usr/sbin symlink: {}", e))?;
     }
 
-    if let Some(ref env_map) = manifest.build.env {
-        for (k, v) in env_map {
-            cmd.arg(format!("--setenv={}={}", k, v));
+    // Delete any existing tarball for the target package in builder_output_root to force rebuild
+    if builder_output_root.exists() {
+        let prefix = format!("{}-", package_name);
+        if let Ok(entries) = fs::read_dir(&builder_output_root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.starts_with(&prefix) && name_str.ends_with(".tar.gz") {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
         }
     }
 
-    cmd.arg("--setenv=DESTDIR=/workspace/dest");
-    cmd.arg("/usr/bin/just").arg("-f").arg("/workspace/package.justfile").arg("-d").arg("/workspace/src").arg("build").arg("package");
+    let mut cmd = Command::new("systemd-nspawn");
+    cmd.arg("-D").arg(&sandbox_dir)
+       .arg("--bind").arg(format!("{}:/workspace/packages", packages_dir.to_string_lossy()))
+       .arg("--bind").arg(format!("{}:/workspace/build", builder_root.to_string_lossy()))
+       .arg("--bind").arg(format!("{}:/workspace/packages_output", builder_output_root.to_string_lossy()))
+       .arg("--as-pid2");
 
-    println!("Spawning systemd-nspawn build...");
-    let output = cmd
-        .output()
+    // Pass environment variables into the container using --setenv
+    cmd.arg("--setenv=STRAYLIGHT_PACKAGES_ROOT=/workspace/packages");
+    cmd.arg("--setenv=STRAYLIGHT_BUILDER_ROOT=/workspace/build");
+    cmd.arg("--setenv=STRAYLIGHT_BUILDER_OUTPUT_ROOT=/workspace/packages_output");
+
+    // Spawn the fspack.py build --pkg command inside the container
+    cmd.arg("/usr/bin/python3")
+       .arg("/workspace/packages/fspack.py")
+       .arg("build")
+       .arg("--pkg")
+       .arg(package_name)
+       .arg("--with-deps");
+
+    println!("Spawning systemd-nspawn build for package '{}'...", package_name);
+    let status = cmd.status()
         .map_err(|e| format!("Failed to run systemd-nspawn command: {}", e))?;
 
-    if !output.status.success() {
-        let stdout_str = String::from_utf8_lossy(&output.stdout);
-        let stderr_str = String::from_utf8_lossy(&output.stderr);
-        eprintln!("--- Sandbox build stdout ---");
-        eprintln!("{}", stdout_str);
-        eprintln!("--- Sandbox build stderr ---");
-        eprintln!("{}", stderr_str);
+    if !status.success() {
         return Err(format!(
-            "Sandbox build exited with non-zero status: {:?}",
-            output.status.code()
+            "Sandbox package build exited with non-zero status: {:?}",
+            status.code()
         ));
     }
-
-    // Phase 7: Stage and Bundle Output Package
-    let staging_dir = build_cache_dir.join("staging");
-    if staging_dir.exists() {
-        fs::remove_dir_all(&staging_dir)
-            .map_err(|e| format!("Failed to clear existing staging dir: {}", e))?;
-    }
-    fs::create_dir_all(&staging_dir).map_err(|e| format!("Failed to create staging dir: {}", e))?;
-
-    let dest_usr = dest_dir.join("usr");
-    let staging_usr = staging_dir.join("usr");
-    if dest_usr.exists() {
-        fs::rename(&dest_usr, &staging_usr)
-            .map_err(|e| format!("Failed to move dest/usr to staging/usr: {}", e))?;
-    } else {
-        return Err(format!(
-            "Expected build output directory {:?} was not created by the build process",
-            dest_usr
-        ));
-    }
-
-    let meta_dir = staging_dir.join("meta");
-    fs::create_dir_all(&meta_dir)
-        .map_err(|e| format!("Failed to create staging meta dir: {}", e))?;
-
-    let binary_manifest = BinaryPackageManifest {
-        package: manifest.package.clone(),
-    };
-    let binary_manifest_toml = toml::to_string(&binary_manifest)
-        .map_err(|e| format!("Failed to serialize binary manifest: {}", e))?;
-    let meta_manifest = meta_dir.join("package.manifest");
-    fs::write(&meta_manifest, binary_manifest_toml)
-        .map_err(|e| format!("Failed to write binary manifest: {}", e))?;
-
-    let hooks_src = package_dir.join("hooks");
-    if hooks_src.exists() {
-        let hooks_dest = meta_dir.join("hooks");
-        copy_dir_all(&hooks_src, &hooks_dest)?;
-    }
-
-    let mut files_entries = Vec::new();
-    traverse_staging(&staging_dir, &staging_dir, &mut files_entries)?;
-
-    let ledger = FilesLedger {
-        files: files_entries,
-    };
-    let ledger_toml =
-        toml::to_string(&ledger).map_err(|e| format!("Failed to serialize files ledger: {}", e))?;
-
-    let ledger_path = meta_dir.join("files.toml");
-    fs::write(&ledger_path, ledger_toml)
-        .map_err(|e| format!("Failed to write files ledger: {}", e))?;
-
-    fs::create_dir_all(&builder_output_root)
-        .map_err(|e| format!("Failed to create output directory: {}", e))?;
-
-    let archive_filename = format!(
-        "{}-{}-1.tar.gz",
-        manifest.package.name, manifest.package.version
-    );
-    let archive_path = builder_output_root.join(&archive_filename);
-    println!("Archiving staging root to {:?}", archive_path);
-    create_tar_gz(&staging_dir, &archive_path)?;
 
     Ok(())
 }
@@ -661,5 +600,141 @@ pub fn build_group(group_name: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestCleanup {
+        path: PathBuf,
+    }
+
+    impl Drop for TestCleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn create_temp_test_dir(name: &str) -> (PathBuf, TestCleanup) {
+        let mut path = std::env::temp_dir();
+        path.push(format!("straylight_test_{}_{}_{}", name, std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        let cleanup = TestCleanup { path: path.clone() };
+        (path, cleanup)
+    }
+
+    #[test]
+    fn test_has_compiled_tarball() {
+        let (path, _cleanup) = create_temp_test_dir("has_compiled_tarball");
+        
+        // No tarballs
+        assert!(!has_compiled_tarball("foo", &path).unwrap());
+        
+        // Write a matching tarball
+        fs::write(path.join("foo-1.0.0-1.tar.gz"), b"").unwrap();
+        assert!(has_compiled_tarball("foo", &path).unwrap());
+        
+        // Write a non-matching tarball
+        assert!(!has_compiled_tarball("bar", &path).unwrap());
+        
+        // musl should always return true
+        assert!(has_compiled_tarball("musl", &path).unwrap());
+    }
+
+    #[test]
+    fn test_load_package_manifest() {
+        let (path, _cleanup) = create_temp_test_dir("load_package_manifest");
+        
+        let pkg_dir = path.join("foo");
+        fs::create_dir_all(&pkg_dir).unwrap();
+        
+        let manifest_content = r#"
+[package]
+name = "foo"
+version = "1.0.0"
+description = "test package"
+dependencies = ["bar"]
+group = "system"
+
+[build]
+dependencies = ["baz"]
+"#;
+        fs::write(pkg_dir.join("package.manifest"), manifest_content).unwrap();
+        
+        let manifest = load_package_manifest(&path, "foo").unwrap();
+        assert_eq!(manifest.package.name, "foo");
+        assert_eq!(manifest.package.version, "1.0.0");
+        assert_eq!(manifest.package.dependencies, vec!["bar".to_string()]);
+        assert_eq!(manifest.build.dependencies, vec!["baz".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_build_order() {
+        let (path, _cleanup) = create_temp_test_dir("resolve_build_order");
+        
+        let create_pkg = |name: &str, deps: &[&str], build_deps: &[&str]| {
+            let pkg_dir = path.join(name);
+            fs::create_dir_all(&pkg_dir).unwrap();
+            let dep_strs: Vec<String> = deps.iter().map(|s| format!("\"{}\"", s)).collect();
+            let build_dep_strs: Vec<String> = build_deps.iter().map(|s| format!("\"{}\"", s)).collect();
+            let content = format!(
+                r#"
+[package]
+name = "{}"
+version = "1.0.0"
+description = "test"
+dependencies = [{}]
+
+[build]
+dependencies = [{}]
+"#,
+                name,
+                dep_strs.join(", "),
+                build_dep_strs.join(", ")
+            );
+            fs::write(pkg_dir.join("package.manifest"), content).unwrap();
+        };
+
+        create_pkg("foo", &["bar"], &[]);
+        create_pkg("bar", &[], &["baz"]);
+        create_pkg("baz", &[], &[]);
+        
+        let order = resolve_build_order("foo", &path).unwrap();
+        assert_eq!(order, vec!["baz".to_string(), "bar".to_string(), "foo".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_build_order_cycle() {
+        let (path, _cleanup) = create_temp_test_dir("resolve_build_order_cycle");
+        
+        let create_pkg = |name: &str, deps: &[&str]| {
+            let pkg_dir = path.join(name);
+            fs::create_dir_all(&pkg_dir).unwrap();
+            let dep_strs: Vec<String> = deps.iter().map(|s| format!("\"{}\"", s)).collect();
+            let content = format!(
+                r#"
+[package]
+name = "{}"
+version = "1.0.0"
+description = "test"
+dependencies = [{}]
+
+[build]
+"#,
+                name,
+                dep_strs.join(", ")
+            );
+            fs::write(pkg_dir.join("package.manifest"), content).unwrap();
+        };
+
+        create_pkg("foo", &["bar"]);
+        create_pkg("bar", &["foo"]);
+        
+        let res = resolve_build_order("foo", &path);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("cycle"));
+    }
 }
 
