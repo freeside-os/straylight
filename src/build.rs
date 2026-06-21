@@ -460,25 +460,13 @@ pub fn build_package(package_name: &str) -> Result<(), String> {
         }
     }
 
-    let mut cmd = Command::new("systemd-nspawn");
-    cmd.arg("-D").arg(&sandbox_dir)
-       .arg("--bind").arg(format!("{}:/workspace/packages", packages_dir.to_string_lossy()))
-       .arg("--bind").arg(format!("{}:/workspace/build", builder_root.to_string_lossy()))
-       .arg("--bind").arg(format!("{}:/workspace/packages_output", builder_output_root.to_string_lossy()))
-       .arg("--as-pid2");
-
-    // Pass environment variables into the container using --setenv
-    cmd.arg("--setenv=STRAYLIGHT_PACKAGES_ROOT=/workspace/packages");
-    cmd.arg("--setenv=STRAYLIGHT_BUILDER_ROOT=/workspace/build");
-    cmd.arg("--setenv=STRAYLIGHT_BUILDER_OUTPUT_ROOT=/workspace/packages_output");
-
-    // Spawn the fspack.py build --pkg command inside the container
-    cmd.arg("/usr/bin/python3")
-       .arg("/workspace/packages/fspack.py")
-       .arg("build")
-       .arg("--pkg")
-       .arg(package_name)
-       .arg("--with-deps");
+    let mut cmd = build_nspawn_command(
+        &sandbox_dir,
+        &packages_dir,
+        &builder_root,
+        &builder_output_root,
+        package_name,
+    );
 
     println!("Spawning systemd-nspawn build for package '{}'...", package_name);
     let status = cmd.status()
@@ -569,8 +557,66 @@ pub fn build_group(group_name: &str) -> Result<(), String> {
         }
     }
 
+    let mut cmd = build_group_nspawn_command(
+        &sandbox_dir,
+        &packages_dir,
+        &builder_root,
+        &builder_output_root,
+        group_name,
+    );
+
+    println!("Spawning systemd-nspawn group build for '{}'...", group_name);
+    let status = cmd.status()
+        .map_err(|e| format!("Failed to run systemd-nspawn command: {}", e))?;
+
+    if !status.success() {
+        return Err(format!(
+            "Sandbox group build exited with non-zero status: {:?}",
+            status.code()
+        ));
+    }
+
+    Ok(())
+}
+
+fn build_nspawn_command(
+    sandbox_dir: &Path,
+    packages_dir: &Path,
+    builder_root: &Path,
+    builder_output_root: &Path,
+    package_name: &str,
+) -> Command {
     let mut cmd = Command::new("systemd-nspawn");
-    cmd.arg("-D").arg(&sandbox_dir)
+    cmd.arg("-D").arg(sandbox_dir)
+       .arg("--bind").arg(format!("{}:/workspace/packages", packages_dir.to_string_lossy()))
+       .arg("--bind").arg(format!("{}:/workspace/build", builder_root.to_string_lossy()))
+       .arg("--bind").arg(format!("{}:/workspace/packages_output", builder_output_root.to_string_lossy()))
+       .arg("--as-pid2");
+
+    // Pass environment variables into the container using --setenv
+    cmd.arg("--setenv=STRAYLIGHT_PACKAGES_ROOT=/workspace/packages");
+    cmd.arg("--setenv=STRAYLIGHT_BUILDER_ROOT=/workspace/build");
+    cmd.arg("--setenv=STRAYLIGHT_BUILDER_OUTPUT_ROOT=/workspace/packages_output");
+
+    // Spawn the fspack.py build --pkg command inside the container
+    cmd.arg("/usr/bin/python3")
+       .arg("/workspace/packages/fspack.py")
+       .arg("build")
+       .arg("--pkg")
+       .arg(package_name)
+       .arg("--with-deps");
+    cmd
+}
+
+fn build_group_nspawn_command(
+    sandbox_dir: &Path,
+    packages_dir: &Path,
+    builder_root: &Path,
+    builder_output_root: &Path,
+    group_name: &str,
+) -> Command {
+    let mut cmd = Command::new("systemd-nspawn");
+    cmd.arg("-D").arg(sandbox_dir)
        .arg("--bind").arg(format!("{}:/workspace/packages", packages_dir.to_string_lossy()))
        .arg("--bind").arg(format!("{}:/workspace/build", builder_root.to_string_lossy()))
        .arg("--bind").arg(format!("{}:/workspace/packages_output", builder_output_root.to_string_lossy()))
@@ -587,19 +633,7 @@ pub fn build_group(group_name: &str) -> Result<(), String> {
        .arg("build")
        .arg("--group")
        .arg(group_name);
-
-    println!("Spawning systemd-nspawn group build for '{}'...", group_name);
-    let status = cmd.status()
-        .map_err(|e| format!("Failed to run systemd-nspawn command: {}", e))?;
-
-    if !status.success() {
-        return Err(format!(
-            "Sandbox group build exited with non-zero status: {:?}",
-            status.code()
-        ));
-    }
-
-    Ok(())
+    cmd
 }
 
 #[cfg(test)]
@@ -735,6 +769,89 @@ dependencies = [{}]
         let res = resolve_build_order("foo", &path);
         assert!(res.is_err());
         assert!(res.unwrap_err().contains("cycle"));
+    }
+
+    #[test]
+    fn test_build_nspawn_command() {
+        let sandbox_dir = Path::new("/tmp/sandbox");
+        let packages_dir = Path::new("/tmp/packages");
+        let builder_root = Path::new("/tmp/build");
+        let builder_output_root = Path::new("/tmp/packages_output");
+        let package_name = "test-pkg";
+
+        let cmd = build_nspawn_command(
+            sandbox_dir,
+            packages_dir,
+            builder_root,
+            builder_output_root,
+            package_name,
+        );
+
+        assert_eq!(cmd.get_program(), "systemd-nspawn");
+
+        let args: Vec<String> = cmd.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        // Check sandbox dir argument
+        assert!(args.contains(&"-D".to_string()));
+        let d_idx = args.iter().position(|r| r == "-D").unwrap();
+        assert_eq!(args[d_idx + 1], "/tmp/sandbox");
+
+        // Check binds
+        assert!(args.contains(&"--bind".to_string()));
+        assert!(args.contains(&"/tmp/packages:/workspace/packages".to_string()));
+        assert!(args.contains(&"/tmp/build:/workspace/build".to_string()));
+        assert!(args.contains(&"/tmp/packages_output:/workspace/packages_output".to_string()));
+
+        // Check fspack call
+        assert!(args.contains(&"/usr/bin/python3".to_string()));
+        assert!(args.contains(&"/workspace/packages/fspack.py".to_string()));
+        assert!(args.contains(&"build".to_string()));
+        assert!(args.contains(&"--pkg".to_string()));
+        assert!(args.contains(&"test-pkg".to_string()));
+        assert!(args.contains(&"--with-deps".to_string()));
+    }
+
+    #[test]
+    fn test_build_group_nspawn_command() {
+        let sandbox_dir = Path::new("/tmp/sandbox");
+        let packages_dir = Path::new("/tmp/packages");
+        let builder_root = Path::new("/tmp/build");
+        let builder_output_root = Path::new("/tmp/packages_output");
+        let group_name = "test-group";
+
+        let cmd = build_group_nspawn_command(
+            sandbox_dir,
+            packages_dir,
+            builder_root,
+            builder_output_root,
+            group_name,
+        );
+
+        assert_eq!(cmd.get_program(), "systemd-nspawn");
+
+        let args: Vec<String> = cmd.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+
+        // Check sandbox dir argument
+        assert!(args.contains(&"-D".to_string()));
+        let d_idx = args.iter().position(|r| r == "-D").unwrap();
+        assert_eq!(args[d_idx + 1], "/tmp/sandbox");
+
+        // Check binds
+        assert!(args.contains(&"--bind".to_string()));
+        assert!(args.contains(&"/tmp/packages:/workspace/packages".to_string()));
+        assert!(args.contains(&"/tmp/build:/workspace/build".to_string()));
+        assert!(args.contains(&"/tmp/packages_output:/workspace/packages_output".to_string()));
+
+        // Check fspack call
+        assert!(args.contains(&"/usr/bin/python3".to_string()));
+        assert!(args.contains(&"/workspace/packages/fspack.py".to_string()));
+        assert!(args.contains(&"build".to_string()));
+        assert!(args.contains(&"--group".to_string()));
+        assert!(args.contains(&"test-group".to_string()));
     }
 }
 
