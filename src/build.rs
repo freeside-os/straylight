@@ -332,7 +332,7 @@ fn extract_dependency(dep_name: &str, builder_output_root: &Path, sandbox_dir: &
     Ok(())
 }
 
-pub fn build_package(package_name: &str) -> Result<(), String> {
+pub fn build_package(package_name: &str, keep_sandbox: bool) -> Result<(), String> {
     // Phase 0: Check privileges and environments
     if !is_root() {
         return Err("Unauthorized: 'straylight build' requires root/sudo privileges to run systemd-nspawn sandboxes.".to_string());
@@ -466,6 +466,7 @@ pub fn build_package(package_name: &str) -> Result<(), String> {
         &builder_root,
         &builder_output_root,
         package_name,
+        keep_sandbox,
     );
 
     println!("Spawning systemd-nspawn build for package '{}'...", package_name);
@@ -482,7 +483,7 @@ pub fn build_package(package_name: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn build_group(group_name: &str) -> Result<(), String> {
+pub fn build_group(group_name: &str, keep_sandbox: bool) -> Result<(), String> {
     if !is_root() {
         return Err("Unauthorized: 'straylight build' requires root/sudo privileges to run systemd-nspawn sandboxes.".to_string());
     }
@@ -563,6 +564,7 @@ pub fn build_group(group_name: &str) -> Result<(), String> {
         &builder_root,
         &builder_output_root,
         group_name,
+        keep_sandbox,
     );
 
     println!("Spawning systemd-nspawn group build for '{}'...", group_name);
@@ -585,13 +587,15 @@ fn build_nspawn_command(
     builder_root: &Path,
     builder_output_root: &Path,
     package_name: &str,
+    keep_sandbox: bool,
 ) -> Command {
     let mut cmd = Command::new("systemd-nspawn");
     cmd.arg("-D").arg(sandbox_dir)
        .arg("--bind").arg(format!("{}:/workspace/packages", packages_dir.to_string_lossy()))
        .arg("--bind").arg(format!("{}:/workspace/build", builder_root.to_string_lossy()))
        .arg("--bind").arg(format!("{}:/workspace/packages_output", builder_output_root.to_string_lossy()))
-       .arg("--as-pid2");
+       .arg("--as-pid2")
+       .arg("--register=no");
 
     // Pass environment variables into the container using --setenv
     cmd.arg("--setenv=STRAYLIGHT_PACKAGES_ROOT=/workspace/packages");
@@ -605,6 +609,9 @@ fn build_nspawn_command(
        .arg("--pkg")
        .arg(package_name)
        .arg("--with-deps");
+    if keep_sandbox {
+        cmd.arg("--keep-sandbox");
+    }
     cmd
 }
 
@@ -614,13 +621,15 @@ fn build_group_nspawn_command(
     builder_root: &Path,
     builder_output_root: &Path,
     group_name: &str,
+    keep_sandbox: bool,
 ) -> Command {
     let mut cmd = Command::new("systemd-nspawn");
     cmd.arg("-D").arg(sandbox_dir)
        .arg("--bind").arg(format!("{}:/workspace/packages", packages_dir.to_string_lossy()))
        .arg("--bind").arg(format!("{}:/workspace/build", builder_root.to_string_lossy()))
        .arg("--bind").arg(format!("{}:/workspace/packages_output", builder_output_root.to_string_lossy()))
-       .arg("--as-pid2");
+       .arg("--as-pid2")
+       .arg("--register=no");
 
     // Pass environment variables into the container using --setenv
     cmd.arg("--setenv=STRAYLIGHT_PACKAGES_ROOT=/workspace/packages");
@@ -633,6 +642,9 @@ fn build_group_nspawn_command(
        .arg("build")
        .arg("--group")
        .arg(group_name);
+    if keep_sandbox {
+        cmd.arg("--keep-sandbox");
+    }
     cmd
 }
 
@@ -785,6 +797,7 @@ dependencies = [{}]
             builder_root,
             builder_output_root,
             package_name,
+            false,
         );
 
         assert_eq!(cmd.get_program(), "systemd-nspawn");
@@ -804,6 +817,8 @@ dependencies = [{}]
         assert!(args.contains(&"/tmp/build:/workspace/build".to_string()));
         assert!(args.contains(&"/tmp/packages_output:/workspace/packages_output".to_string()));
 
+        assert!(args.contains(&"--register=no".to_string()));
+
         // Check fspack call
         assert!(args.contains(&"/usr/bin/python3".to_string()));
         assert!(args.contains(&"/workspace/packages/fspack.py".to_string()));
@@ -811,6 +826,21 @@ dependencies = [{}]
         assert!(args.contains(&"--pkg".to_string()));
         assert!(args.contains(&"test-pkg".to_string()));
         assert!(args.contains(&"--with-deps".to_string()));
+        assert!(!args.contains(&"--keep-sandbox".to_string()));
+
+        // Test with keep_sandbox = true
+        let cmd_keep = build_nspawn_command(
+            sandbox_dir,
+            packages_dir,
+            builder_root,
+            builder_output_root,
+            package_name,
+            true,
+        );
+        let args_keep: Vec<String> = cmd_keep.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args_keep.contains(&"--keep-sandbox".to_string()));
     }
 
     #[test]
@@ -827,6 +857,7 @@ dependencies = [{}]
             builder_root,
             builder_output_root,
             group_name,
+            false,
         );
 
         assert_eq!(cmd.get_program(), "systemd-nspawn");
@@ -846,12 +877,29 @@ dependencies = [{}]
         assert!(args.contains(&"/tmp/build:/workspace/build".to_string()));
         assert!(args.contains(&"/tmp/packages_output:/workspace/packages_output".to_string()));
 
+        assert!(args.contains(&"--register=no".to_string()));
+
         // Check fspack call
         assert!(args.contains(&"/usr/bin/python3".to_string()));
         assert!(args.contains(&"/workspace/packages/fspack.py".to_string()));
         assert!(args.contains(&"build".to_string()));
         assert!(args.contains(&"--group".to_string()));
         assert!(args.contains(&"test-group".to_string()));
+        assert!(!args.contains(&"--keep-sandbox".to_string()));
+
+        // Test with keep_sandbox = true
+        let cmd_keep = build_group_nspawn_command(
+            sandbox_dir,
+            packages_dir,
+            builder_root,
+            builder_output_root,
+            group_name,
+            true,
+        );
+        let args_keep: Vec<String> = cmd_keep.get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(args_keep.contains(&"--keep-sandbox".to_string()));
     }
 }
 
